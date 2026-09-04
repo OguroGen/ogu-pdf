@@ -1,0 +1,7 @@
+node_modules
+dist
+*.local
+tmp
+public/fixtures
+public/qpdf/qpdf.js
+public/qpdf/qpdf.wasm
