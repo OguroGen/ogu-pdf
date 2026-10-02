@@ -1,10 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { DropZone } from "./components/DropZone";
+import { FileList } from "./components/FileList";
 import { PasswordDialog } from "./components/PasswordDialog";
 import { PdfViewer } from "./components/PdfViewer";
 import { Toolbar } from "./components/Toolbar";
-import { decryptPdf, downloadPdf, unlockedFileName } from "./lib/decryptPdf";
+import { decryptPdf } from "./lib/decryptPdf";
+import {
+  isAbortError,
+  readEntryBytes,
+  saveUnlockedPdf,
+  type PdfEntry,
+} from "./lib/localFiles";
 import { openPdf } from "./lib/openPdf";
 
 const MIN_SCALE = 0.5;
@@ -12,23 +19,37 @@ const MAX_SCALE = 3;
 const SCALE_STEP = 0.25;
 
 type Session = {
-  fileName: string;
+  entry: PdfEntry;
   bytes: Uint8Array;
   password: string;
   pdf: PDFDocumentProxy;
 };
 
+function saveResultMessage(method: "directory" | "picker" | "download"): string {
+  if (method === "directory") {
+    return "元のフォルダに、パスワードを外したPDFを保存しました。";
+  }
+  if (method === "picker") {
+    return "パスワードを外したPDFを保存しました。";
+  }
+  return "パスワードを外したPDFをダウンロードしました。保存先はブラウザの設定に従います。";
+}
+
 export default function App() {
+  const [entries, setEntries] = useState<PdfEntry[]>([]);
   const [session, setSession] = useState<Session | null>(null);
-  const [pendingFile, setPendingFile] = useState<{
-    fileName: string;
+  const [pending, setPending] = useState<{
+    entry: PdfEntry;
     bytes: Uint8Array;
   } | null>(null);
+  const [passwords, setPasswords] = useState<Map<string, string>>(() => new Map());
   const [needPassword, setNeedPassword] = useState(false);
   const [wrongPassword, setWrongPassword] = useState(false);
   const [opening, setOpening] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [savingAll, setSavingAll] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [pageNumber, setPageNumber] = useState(1);
   const [scale, setScale] = useState(1.25);
 
@@ -37,53 +58,74 @@ export default function App() {
       void current?.pdf.destroy();
       return null;
     });
-    setPendingFile(null);
+    setEntries([]);
+    setPending(null);
+    setPasswords(new Map());
     setNeedPassword(false);
     setWrongPassword(false);
     setOpening(false);
     setSaving(false);
+    setSavingAll(false);
     setError(null);
+    setNotice(null);
     setPageNumber(1);
     setScale(1.25);
   }, []);
 
-  const tryOpen = useCallback(
-    async (fileName: string, bytes: Uint8Array, password = "") => {
-      setOpening(true);
-      setError(null);
-      const result = await openPdf(bytes, password);
-      setOpening(false);
+  const tryOpen = useCallback(async (entry: PdfEntry, bytes: Uint8Array, password = "") => {
+    setOpening(true);
+    setError(null);
+    setNotice(null);
+    const result = await openPdf(bytes, password);
+    setOpening(false);
 
-      if (result.status === "ok") {
-        setSession((current) => {
-          void current?.pdf.destroy();
-          return { fileName, bytes, password, pdf: result.pdf };
-        });
-        setPendingFile(null);
-        setNeedPassword(false);
-        setWrongPassword(false);
-        setPageNumber(1);
-        return;
-      }
-
-      if (result.status === "password-required") {
-        setPendingFile({ fileName, bytes });
-        setNeedPassword(true);
-        setWrongPassword(result.isWrongPassword);
-        return;
-      }
-
-      setError(result.message);
-      setPendingFile(null);
+    if (result.status === "ok") {
+      setSession((current) => {
+        void current?.pdf.destroy();
+        return { entry, bytes, password, pdf: result.pdf };
+      });
+      setPasswords((current) => {
+        const next = new Map(current);
+        next.set(entry.id, password);
+        return next;
+      });
+      setPending(null);
       setNeedPassword(false);
+      setWrongPassword(false);
+      setPageNumber(1);
+      return;
+    }
+
+    if (result.status === "password-required") {
+      setPending({ entry, bytes });
+      setNeedPassword(true);
+      setWrongPassword(result.isWrongPassword);
+      return;
+    }
+
+    setError(result.message);
+    setPending(null);
+    setNeedPassword(false);
+  }, []);
+
+  const openEntry = useCallback(
+    async (entry: PdfEntry, password?: string) => {
+      try {
+        const bytes = await readEntryBytes(entry);
+        await tryOpen(entry, bytes, password ?? passwords.get(entry.id) ?? "");
+      } catch (openError) {
+        setError(openError instanceof Error ? openError.message : "PDFを開けませんでした。");
+      }
     },
-    [],
+    [passwords, tryOpen],
   );
 
-  const handleFile = async (file: File) => {
+  const handleEntries = async (nextEntries: PdfEntry[]) => {
     reset();
-    const buffer = await file.arrayBuffer();
-    await tryOpen(file.name, new Uint8Array(buffer));
+    setEntries(nextEntries);
+    if (nextEntries[0]) {
+      await openEntry(nextEntries[0], "");
+    }
   };
 
   const handleSave = async () => {
@@ -92,15 +134,53 @@ export default function App() {
     }
     setSaving(true);
     setError(null);
+    setNotice(null);
     try {
       const unlocked = await decryptPdf(session.bytes, session.password);
-      downloadPdf(unlocked, unlockedFileName(session.fileName));
+      const method = await saveUnlockedPdf(session.entry, unlocked);
+      setNotice(saveResultMessage(method));
     } catch (saveError) {
-      setError(
-        saveError instanceof Error ? saveError.message : "解除したPDFの保存に失敗しました。",
-      );
+      if (!isAbortError(saveError)) {
+        setError(
+          saveError instanceof Error ? saveError.message : "解除したPDFの保存に失敗しました。",
+        );
+      }
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleSaveAll = async () => {
+    setSavingAll(true);
+    setError(null);
+    setNotice(null);
+    let saved = 0;
+    let failed = 0;
+    try {
+      for (const entry of entries) {
+        try {
+          const bytes =
+            session?.entry.id === entry.id ? session.bytes : await readEntryBytes(entry);
+          const password =
+            session?.entry.id === entry.id
+              ? session.password
+              : (passwords.get(entry.id) ?? "");
+          const unlocked = await decryptPdf(bytes, password);
+          await saveUnlockedPdf(entry, unlocked);
+          saved += 1;
+        } catch {
+          failed += 1;
+        }
+      }
+      if (failed === 0) {
+        setNotice(`${saved}件を、元のフォルダに保存しました。`);
+      } else {
+        setError(
+          `${saved}件を保存し、${failed}件は失敗しました。パスワードが必要なファイルは先に開いてください。`,
+        );
+      }
+    } finally {
+      setSavingAll(false);
     }
   };
 
@@ -123,54 +203,93 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [session]);
 
+  const viewing = entries.length > 0;
+
   return (
     <div className="flex min-h-dvh flex-col">
-      {session ? (
+      {viewing ? (
         <>
           <Toolbar
-            fileName={session.fileName}
+            fileName={session?.entry.relativePath ?? entries[0]?.relativePath ?? ""}
             pageNumber={pageNumber}
-            pageCount={session.pdf.numPages}
+            pageCount={session?.pdf.numPages ?? 0}
             scale={scale}
             saving={saving}
+            savingAll={savingAll}
+            canSave={Boolean(session)}
+            canSaveAll={entries.length > 1 && entries.every((entry) => entry.directoryHandle)}
             onPrev={() => setPageNumber((page) => Math.max(1, page - 1))}
             onNext={() =>
-              setPageNumber((page) => Math.min(session.pdf.numPages, page + 1))
+              setPageNumber((page) => Math.min(session?.pdf.numPages ?? 1, page + 1))
             }
             onZoomOut={() => setScale((value) => Math.max(MIN_SCALE, value - SCALE_STEP))}
             onZoomIn={() => setScale((value) => Math.min(MAX_SCALE, value + SCALE_STEP))}
             onSave={() => void handleSave()}
+            onSaveAll={() => void handleSaveAll()}
             onClose={reset}
           />
-          <main className="flex flex-1 justify-center overflow-auto bg-[#0c1016] px-4 py-8">
-            {session.pdf.numPages === 0 ? (
-              <p className="self-center text-sm text-white/60">このPDFには表示できるページがありません。</p>
-            ) : (
-              <PdfViewer pdf={session.pdf} pageNumber={pageNumber} scale={scale} />
-            )}
-          </main>
+          <div className="flex min-h-0 flex-1">
+            <FileList
+              entries={entries}
+              activeId={session?.entry.id ?? pending?.entry.id}
+              onSelect={(entry) => {
+                if (entry.id !== session?.entry.id) {
+                  void openEntry(entry);
+                }
+              }}
+            />
+            <main className="flex flex-1 justify-center overflow-auto bg-[#0c1016] px-4 py-8">
+              {session ? (
+                session.pdf.numPages === 0 ? (
+                  <p className="self-center text-sm text-white/60">
+                    このPDFには表示できるページがありません。
+                  </p>
+                ) : (
+                  <PdfViewer pdf={session.pdf} pageNumber={pageNumber} scale={scale} />
+                )
+              ) : (
+                <p className="self-center text-sm text-white/60">
+                  左の一覧からPDFを選んでください。
+                </p>
+              )}
+            </main>
+          </div>
           <p className="border-t border-white/10 bg-[#161c26] px-4 py-3 text-center text-xs leading-6 text-white/50">
-            保存したPDFにはパスワード保護がなくなります。閲覧も解除も、この端末の中だけで行われます。
+            保存したPDFにはパスワード保護がなくなります。元のファイルは残し、同じ場所に
+            `_unlocked.pdf` として保存します。
+            {notice ? <span className="block text-[#9fd4a8]">{notice}</span> : null}
             {error ? <span className="block text-[#f0a090]">{error}</span> : null}
           </p>
         </>
       ) : (
         <>
-          <DropZone disabled={opening} error={error} onFile={(file) => void handleFile(file)} />
+          <DropZone
+            disabled={opening}
+            error={error}
+            onEntries={(next) => void handleEntries(next)}
+            onError={setError}
+          />
           <p className="px-4 py-6 text-center text-xs text-white/40">
             開封用パスワードが分かるPDFに対応しています。パスワード解析は行いません。
           </p>
         </>
       )}
 
-      {needPassword && pendingFile ? (
+      {needPassword && pending ? (
         <PasswordDialog
-          fileName={pendingFile.fileName}
+          fileName={pending.entry.relativePath}
           isWrongPassword={wrongPassword}
           onSubmit={(password) => {
-            void tryOpen(pendingFile.fileName, pendingFile.bytes, password);
+            void tryOpen(pending.entry, pending.bytes, password);
           }}
-          onCancel={reset}
+          onCancel={() => {
+            setNeedPassword(false);
+            setWrongPassword(false);
+            setPending(null);
+            if (!session && entries.length <= 1) {
+              reset();
+            }
+          }}
         />
       ) : null}
     </div>

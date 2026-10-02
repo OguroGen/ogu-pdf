@@ -4,11 +4,15 @@ type ToolbarProps = {
   pageCount: number;
   scale: number;
   saving: boolean;
+  savingAll: boolean;
+  canSave: boolean;
+  canSaveAll: boolean;
   onPrev: () => void;
   onNext: () => void;
   onZoomOut: () => void;
   onZoomIn: () => void;
   onSave: () => void;
+  onSaveAll: () => void;
   onClose: () => void;
 };
 
@@ -18,11 +22,15 @@ export function Toolbar({
   pageCount,
   scale,
   saving,
+  savingAll,
+  canSave,
+  canSaveAll,
   onPrev,
   onNext,
   onZoomOut,
   onZoomIn,
   onSave,
+  onSaveAll,
   onClose,
 }: ToolbarProps) {
   return (
@@ -69,9 +77,19 @@ export function Toolbar({
           ＋
         </button>
       </div>
+      {canSaveAll ? (
+        <button
+          type="button"
+          disabled={saving || savingAll}
+          className="rounded-lg border border-white/15 px-3 py-1.5 text-sm text-white/85 hover:bg-white/5 disabled:opacity-60"
+          onClick={onSaveAll}
+        >
+          {savingAll ? "一括保存しています…" : "すべて保存"}
+        </button>
+      ) : null}
       <button
         type="button"
-        disabled={saving}
+        disabled={saving || savingAll || !canSave}
         className="rounded-lg bg-[#c56a32] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#d1763d] disabled:opacity-60"
         onClick={onSave}
       >
